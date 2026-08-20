@@ -1,0 +1,15 @@
+[package]
+name = "clipboard-yy"
+version = "0.1.0"
+edition = "2021"
+description = "剪贴板增强工具（Rust + Slint）"
+
+[dependencies]
+slint = "1"
+
+[build-dependencies]
+slint-build = "1"
+
+[profile.release]
+strip = true
+lto = true

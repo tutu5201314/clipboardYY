@@ -1,0 +1,58 @@
+import { ListView } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "剪贴板工具";
+    width: 480px;
+    height: 640px;
+
+    in property <[string]> clipboard-items: [];
+
+    VerticalLayout {
+        padding: 12px;
+
+        // 顶部：标题 + 状态
+        HorizontalLayout {
+            Text {
+                text: "剪贴板历史";
+                font-size: 20px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle { }
+            Text {
+                text: "0 条记录";
+                color: #888;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle { height: 1px; background: #ddd; }
+
+        // 中部：剪贴板条目列表
+        ListView {
+            for item in clipboard-items: HorizontalLayout {
+                padding: 8px;
+                Rectangle {
+                    border-radius: 6px;
+                    background: #f5f5f5;
+                    Text {
+                        text: item;
+                        wrap: word-wrap;
+                        color: #222;
+                    }
+                }
+            }
+        }
+
+        // 底部：操作按钮
+        HorizontalLayout {
+            alignment: end;
+            Button {
+                text: "清空";
+            }
+            Button {
+                text: "刷新";
+            }
+        }
+    }
+}
