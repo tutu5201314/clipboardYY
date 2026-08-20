@@ -6,6 +6,7 @@ description = "剪贴板增强工具（Rust + Slint）"
 
 [dependencies]
 slint = "1"
+arboard = "3"
 
 [build-dependencies]
 slint-build = "1"

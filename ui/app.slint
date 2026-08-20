@@ -6,6 +6,10 @@ export component AppWindow inherits Window {
     height: 640px;
 
     in property <[string]> clipboard-items: [];
+    in property <string> status-text: "0 条记录";
+
+    callback refresh-clicked();
+    callback clear-clicked();
 
     VerticalLayout {
         padding: 12px;
@@ -20,13 +24,21 @@ export component AppWindow inherits Window {
             }
             Rectangle { }
             Text {
-                text: "0 条记录";
+                text: status-text;
                 color: #888;
                 vertical-alignment: center;
             }
         }
 
         Rectangle { height: 1px; background: #ddd; }
+
+        // 空状态提示（有数据时自动隐藏）
+        Text {
+            visible: clipboard-items.length == 0;
+            text: "剪贴板为空 —— 复制点内容试试，会自动出现在这里";
+            wrap: word-wrap;
+            color: #aaa;
+        }
 
         // 中部：剪贴板条目列表
         ListView {
@@ -49,9 +61,11 @@ export component AppWindow inherits Window {
             alignment: end;
             Button {
                 text: "清空";
+                clicked => { clear-clicked(); }
             }
             Button {
                 text: "刷新";
+                clicked => { refresh-clicked(); }
             }
         }
     }
