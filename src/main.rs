@@ -1,12 +1,19 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use slint::{Image, Model, ModelRc, Timer, TimerMode, VecModel};
+use windows_sys::Win32::Foundation::{GlobalFree, HWND, POINT, RECT};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::UI::Shell::{DragQueryFileW, DROPFILES};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetCursorPos, GetWindowRect, IsWindowVisible, SetForegroundWindow, SetWindowPos,
     ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
@@ -19,6 +26,20 @@ slint::include_modules!();
 
 /// 历史记录上限，超出后丢弃最旧的
 const MAX_ENTRIES: usize = 50;
+
+/// CF_HDROP 剪贴板格式（拖放文件列表）
+const CF_HDROP: u32 = 15;
+
+/// 剪贴板内容的三种形态
+enum ClipContent {
+    Text(String),
+    Image {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Files(Vec<PathBuf>),
+}
 
 /// 窗口句柄缓存（Windows 句柄本质是指针，用 isize 存储保证 Sync）
 static HWND_CACHE: OnceLock<isize> = OnceLock::new();
@@ -44,9 +65,6 @@ fn find_window_hwnd() -> Option<isize> {
     None
 }
 
-/// 置顶 / 取消置顶交由 Slint 内置的 Window.always-on-top 属性处理，
-/// 这里不再需要 Win32 手动调用。
-
 /// 显示窗口（SW_RESTORE + SW_SHOW）并置为前台
 fn show_window(hwnd: isize) {
     unsafe {
@@ -54,6 +72,18 @@ fn show_window(hwnd: isize) {
         ShowWindow(hwnd as HWND, SW_SHOW);
         SetForegroundWindow(hwnd as HWND);
     }
+}
+
+/// 隐藏窗口到托盘（Win32 原生隐藏；事件循环不受影响，轮询继续）
+fn hide_window(hwnd: isize) {
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_HIDE);
+    }
+}
+
+/// 查询窗口当前是否可见（用于热键切换判断）
+fn is_window_visible(hwnd: isize) -> bool {
+    unsafe { IsWindowVisible(hwnd as HWND) != 0 }
 }
 
 /// 获取窗口左上角物理坐标
@@ -100,22 +130,92 @@ fn cursor_pos() -> Option<(i32, i32)> {
     }
 }
 
-/// 隐藏窗口到托盘（Win32 原生隐藏；事件循环不受影响，轮询继续）
-fn hide_window(hwnd: isize) {
+/// 读取剪贴板中的文件路径列表（CF_HDROP / 拖放格式）
+fn read_clipboard_files() -> Option<Vec<PathBuf>> {
     unsafe {
-        ShowWindow(hwnd as HWND, SW_HIDE);
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let result = (|| {
+            let hdrop = GetClipboardData(CF_HDROP);
+            if hdrop.is_null() {
+                return None;
+            }
+            let count = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
+            if count == 0 {
+                return Some(Vec::new());
+            }
+            let mut paths = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, std::ptr::null_mut(), 0);
+                let mut buf = vec![0u16; (len + 1) as usize];
+                DragQueryFileW(hdrop, i, buf.as_mut_ptr(), len + 1);
+                let s = String::from_utf16_lossy(&buf[..len as usize]);
+                paths.push(PathBuf::from(s));
+            }
+            Some(paths)
+        })();
+        CloseClipboard();
+        result
     }
 }
 
-/// 查询窗口当前是否可见（用于热键切换判断）
-fn is_window_visible(hwnd: isize) -> bool {
-    unsafe { IsWindowVisible(hwnd as HWND) != 0 }
+/// 读取剪贴板内容：文本 > 图片 > 文件路径列表
+fn read_clipboard_content() -> Option<ClipContent> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    if let Ok(text) = clipboard.get_text() {
+        return Some(ClipContent::Text(text));
+    }
+    if let Ok(img) = clipboard.get_image() {
+        return Some(ClipContent::Image {
+            rgba: img.bytes.into_owned(),
+            width: img.width as u32,
+            height: img.height as u32,
+        });
+    }
+    if let Some(paths) = read_clipboard_files() {
+        if !paths.is_empty() {
+            return Some(ClipContent::Files(paths));
+        }
+    }
+    None
 }
 
-/// 读取系统剪贴板中的纯文本；非文本内容（图片/文件）返回 None
-fn read_clipboard_text() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    clipboard.get_text().ok()
+/// 内容去重指纹：文本/文件用原文，图片用 FNV 哈希
+fn content_key(content: &ClipContent) -> String {
+    match content {
+        ClipContent::Text(t) => t.clone(),
+        ClipContent::Image { rgba, width, height } => {
+            let mut hash = 0xcbf29ce484222325u64;
+            for &b in rgba.iter() {
+                hash = (hash ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+            format!("img:{width}x{height}:{hash:x}")
+        }
+        ClipContent::Files(paths) => paths
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("|"),
+    }
+}
+
+/// 把图片 RGBA 保存为 PNG，返回 (完整路径, 文件名)
+fn save_clipboard_image(rgba: &[u8], width: u32, height: u32) -> Option<(PathBuf, String)> {
+    let dir = storage::images_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let name = format!(
+        "img_{}.png",
+        SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos()
+    );
+    let path = dir.join(&name);
+    image::save_buffer(&path, rgba, width, height, image::ExtendedColorType::Rgba8).ok()?;
+    Some((path, name))
+}
+
+/// 图片文件名 → 完整路径
+fn image_full_path(name: &str) -> PathBuf {
+    storage::images_dir().join(name)
 }
 
 /// 把文本写回系统剪贴板；成功返回 true
@@ -125,6 +225,75 @@ fn write_clipboard_text(text: &str) -> bool {
         Err(_) => return false,
     };
     clipboard.set_text(text.to_string()).is_ok()
+}
+
+/// 把图片文件写回系统剪贴板；成功返回 true
+fn write_clipboard_image(path: &Path) -> bool {
+    let Ok(img) = image::open(path) else {
+        return false;
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(cb) => cb,
+        Err(_) => return false,
+    };
+    clipboard
+        .set_image(arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: Cow::Owned(rgba.into_raw()),
+        })
+        .is_ok()
+}
+
+/// 把文件路径列表写回系统剪贴板（CF_HDROP / 拖放格式）；成功返回 true
+fn write_clipboard_files(paths: &[PathBuf]) -> bool {
+    unsafe {
+        // 构造 DROPFILES + 多路径（WCHAR 双空结尾）
+        let mut wide = Vec::<u16>::new();
+        for p in paths {
+            for u in p.to_string_lossy().encode_utf16() {
+                wide.push(u);
+            }
+            wide.push(0);
+        }
+        wide.push(0); // 列表结束的双空
+
+        let dropfiles_size = std::mem::size_of::<DROPFILES>();
+        let total_bytes = dropfiles_size + wide.len() * 2;
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE, total_bytes);
+        if hglobal.is_null() {
+            return false;
+        }
+        let ptr = GlobalLock(hglobal) as *mut u8;
+        if ptr.is_null() {
+            GlobalFree(hglobal);
+            return false;
+        }
+        let dropfiles = ptr as *mut DROPFILES;
+        (*dropfiles).pFiles = dropfiles_size as u32;
+        (*dropfiles).pt = POINT { x: 0, y: 0 };
+        (*dropfiles).fNC = 0;
+        (*dropfiles).fWide = 1;
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            ptr.add(dropfiles_size) as *mut u16,
+            wide.len(),
+        );
+        GlobalUnlock(hglobal);
+
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            GlobalFree(hglobal);
+            return false;
+        }
+        let ok = EmptyClipboard() != 0 && !SetClipboardData(CF_HDROP, hglobal).is_null();
+        CloseClipboard();
+        if !ok {
+            GlobalFree(hglobal);
+        }
+        ok
+    }
 }
 
 /// 状态栏预览：长文本截断为 limit 字符（含省略号）
@@ -155,10 +324,40 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let history = storage::load_history();
         for entry in history.iter().take(MAX_ENTRIES) {
-            model.push(Entry {
-                text: entry.text.clone().into(),
-                pinned: entry.pinned,
-            });
+            match entry.kind.as_str() {
+                "image" => {
+                    if let Some(name) = &entry.image {
+                        let path = image_full_path(name);
+                        if let Ok(img) = Image::load_from_path(&path) {
+                            model.push(Entry {
+                                text: name.clone().into(),
+                                kind: 1,
+                                pinned: entry.pinned,
+                                image: img,
+                                key: format!("img:{name}").into(),
+                            });
+                        }
+                    }
+                }
+                "file" => {
+                    model.push(Entry {
+                        text: entry.text.clone().into(),
+                        kind: 2,
+                        pinned: entry.pinned,
+                        image: Default::default(),
+                        key: entry.text.clone().into(),
+                    });
+                }
+                _ => {
+                    model.push(Entry {
+                        text: entry.text.clone().into(),
+                        kind: 0,
+                        pinned: entry.pinned,
+                        image: Default::default(),
+                        key: entry.text.clone().into(),
+                    });
+                }
+            }
         }
     }
     ui.set_clipboard_items(ModelRc::from(model.clone()));
@@ -174,31 +373,45 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut entries = Vec::with_capacity(model.row_count());
         for i in 0..model.row_count() {
             if let Some(e) = model.row_data(i) {
+                let kind = match e.kind {
+                    1 => "image",
+                    2 => "file",
+                    _ => "text",
+                };
+                let image = if e.kind == 1 {
+                    Path::new(e.text.as_str())
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
                 entries.push(storage::HistoryEntry {
+                    kind: kind.to_string(),
                     text: e.text.to_string(),
                     pinned: e.pinned,
+                    image,
                 });
             }
         }
         entries
     }
 
-    // 新增一条记录：去重 + 置顶块下方插入 + 上限裁剪 + 持久化
-    fn push_entry(model: &Rc<VecModel<Entry>>, text: &str) {
-        if text.trim().is_empty() {
+    // 新增一条记录：按指纹去重 + 置顶块下方插入 + 上限裁剪 + 持久化
+    fn push_entry(model: &Rc<VecModel<Entry>>, kind: i32, text: String, image: Image, key: String) {
+        if key.trim().is_empty() {
             return;
         }
-        // 去重：与置顶块后最新的第一条相同则忽略（轮询最常见的重复源）
+        // 去重：与最新一条指纹相同则忽略（轮询最常见的重复源）
         let newest = first_unpinned_index(model);
         if newest < model.row_count()
-            && model.row_data(newest).is_some_and(|e| e.text.as_str() == text)
+            && model.row_data(newest).is_some_and(|e| e.key.as_str() == key)
         {
             return;
         }
         // 去重：历史中已存在则先移除旧位置（保留其置顶状态），再重插
         let mut existed_pinned = false;
         for i in 0..model.row_count() {
-            if model.row_data(i).is_some_and(|e| e.text.as_str() == text) {
+            if model.row_data(i).is_some_and(|e| e.key.as_str() == key) {
                 existed_pinned = model.row_data(i).is_some_and(|e| e.pinned);
                 let _ = model.remove(i);
                 break;
@@ -209,13 +422,41 @@ fn main() -> Result<(), slint::PlatformError> {
             insert_at,
             Entry {
                 text: text.into(),
+                kind,
                 pinned: existed_pinned,
+                image,
+                key: key.into(),
             },
         );
         while model.row_count() > MAX_ENTRIES {
             let _ = model.remove(MAX_ENTRIES);
         }
         storage::save_history(&collect_entries(model));
+    }
+
+    // 把读到的剪贴板内容入列（三类统一入口）
+    fn ingest_content(model: &Rc<VecModel<Entry>>, content: ClipContent) {
+        let key = content_key(&content);
+        match content {
+            ClipContent::Text(t) => {
+                push_entry(model, 0, t.clone(), Default::default(), t);
+            }
+            ClipContent::Image { rgba, width, height } => {
+                if let Some((path, name)) = save_clipboard_image(&rgba, width, height) {
+                    if let Ok(img) = Image::load_from_path(&path) {
+                        push_entry(model, 1, name, img, key);
+                    }
+                }
+            }
+            ClipContent::Files(paths) => {
+                let joined = paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                push_entry(model, 2, joined.clone(), Default::default(), joined);
+            }
+        }
     }
 
     // —— 定时轮询：每 500ms 检查剪贴板变化，自动追加历史 ——
@@ -226,13 +467,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
-        let Some(text) = read_clipboard_text() else { return };
-        if *last_seen_timer.borrow() == text {
+        let Some(content) = read_clipboard_content() else { return };
+        let key = content_key(&content);
+        if *last_seen_timer.borrow() == key {
             return; // 内容没变，跳过
         }
-        *last_seen_timer.borrow_mut() = text.clone();
-        push_entry(&poll_model, &text);
-        // 窗口可能已关闭，Weak 升级失败则跳过
+        *last_seen_timer.borrow_mut() = key;
+        ingest_content(&poll_model, content);
+        // 窗口可能已关闭/隐藏，Weak 升级失败则跳过
         if let Some(ui) = poll_ui.upgrade() {
             update_status(&ui, &*poll_model);
         }
@@ -299,27 +541,19 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
-    // —— 标题栏：隐藏到系统托盘（后台轮询继续，托盘/快捷键唤回） ——
-    ui.on_hide_window(move || {
-        if let Some(hwnd) = find_window_hwnd() {
-            hide_window(hwnd);
-            tray::show_icon();
-        }
-    });
-
     // —— 「刷新」按钮：手动读取当前剪贴板 ——
     let refresh_model = model.clone();
     let refresh_ui = ui.as_weak();
     ui.on_refresh_clicked(move || {
         let Some(ui) = refresh_ui.upgrade() else { return };
-        match read_clipboard_text() {
-            Some(text) => {
-                push_entry(&refresh_model, &text);
+        match read_clipboard_content() {
+            Some(content) => {
+                ingest_content(&refresh_model, content);
                 update_status(&ui, &*refresh_model);
                 ui.set_status_text(format!("已刷新，共 {} 条记录", refresh_model.row_count()).into());
             }
             None => {
-                ui.set_status_text("剪贴板中没有文本内容".into());
+                ui.set_status_text("剪贴板中没有可识别的内容".into());
             }
         }
     });
@@ -335,15 +569,29 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_status_text("历史已清空".into());
     });
 
-    // —— 点击条目：把该条内容重新写回系统剪贴板 ——
+    // —— 点击条目：按类型把内容重新写回系统剪贴板 ——
     let copy_model = model.clone();
     let copy_ui = ui.as_weak();
     ui.on_entry_clicked(move |index| {
         let Some(ui) = copy_ui.upgrade() else { return };
         // ListView 的索引不会为负，这里安全转换
         let Some(entry) = copy_model.row_data(index.max(0) as usize) else { return };
-        if write_clipboard_text(entry.text.as_str()) {
-            ui.set_status_text(format!("已复制：{}", preview(entry.text.as_str(), 30)).into());
+        let ok = match entry.kind {
+            1 => write_clipboard_image(&image_full_path(entry.text.as_str())),
+            2 => {
+                let paths: Vec<PathBuf> =
+                    entry.text.split('|').map(PathBuf::from).collect();
+                write_clipboard_files(&paths)
+            }
+            _ => write_clipboard_text(entry.text.as_str()),
+        };
+        if ok {
+            let name = match entry.kind {
+                1 => "图片".to_string(),
+                2 => format!("文件：{}", preview(entry.text.as_str(), 24)),
+                _ => preview(entry.text.as_str(), 30),
+            };
+            ui.set_status_text(format!("已复制：{name}").into());
         } else {
             ui.set_status_text("复制失败：无法访问剪贴板".into());
         }
@@ -362,7 +610,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 i,
                 Entry {
                     text: entry.text.clone(),
+                    kind: entry.kind,
                     pinned: false,
+                    image: entry.image.clone(),
+                    key: entry.key.clone(),
                 },
             );
             ui.set_status_text(format!("已取消置顶：{}", preview(entry.text.as_str(), 20)).into());
@@ -374,7 +625,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 pin_end,
                 Entry {
                     text: entry.text.clone(),
+                    kind: entry.kind,
                     pinned: true,
+                    image: entry.image.clone(),
+                    key: entry.key.clone(),
                 },
             );
             ui.set_status_text(format!("已置顶：{}", preview(entry.text.as_str(), 20)).into());
@@ -425,6 +679,14 @@ fn main() -> Result<(), slint::PlatformError> {
         *drag_state_end.borrow_mut() = None;
     });
 
+    // —— 标题栏：隐藏到系统托盘（后台轮询继续，托盘/快捷键唤回） ——
+    ui.on_hide_window(move || {
+        if let Some(hwnd) = find_window_hwnd() {
+            hide_window(hwnd);
+            tray::show_icon();
+        }
+    });
+
     // —— 标题栏：关闭程序（清理托盘图标后退出） ——
     ui.on_close_window(|| {
         tray::shutdown();
@@ -441,9 +703,10 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     // 启动时读取一次当前剪贴板
-    if let Some(text) = read_clipboard_text() {
-        *last_seen.borrow_mut() = text.clone();
-        push_entry(&model, &text);
+    if let Some(content) = read_clipboard_content() {
+        let key = content_key(&content);
+        *last_seen.borrow_mut() = key;
+        ingest_content(&model, content);
         update_status(&ui, &*model);
     }
 

@@ -2,24 +2,45 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// 一条历史记录：文本 + 是否置顶
+fn default_kind() -> String {
+    "text".to_string()
+}
+
+/// 一条历史记录
+/// - kind: "text" | "image" | "file"
+/// - text: 文本内容 / 文件路径（用 | 分隔）/ 图片条目的完整保存路径
+/// - image: 图片文件名（images/ 目录下），仅 kind=image 时使用
 #[derive(Serialize, Deserialize, Clone)]
 pub struct HistoryEntry {
+    #[serde(default = "default_kind")]
+    pub kind: String,
     pub text: String,
+    #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
-/// 历史记录文件路径：系统应用数据目录下的 clipboard-yy/history.json
+fn data_dir() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("clipboard-yy")
+}
+
+/// 历史记录文件路径
 /// Windows 上即 %APPDATA%\clipboard-yy\history.json
 fn history_file_path() -> PathBuf {
-    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("clipboard-yy").join("history.json")
+    data_dir().join("history.json")
 }
 
-/// 启动时加载历史记录；兼容两种格式：
-/// - 新格式 `[{text, pinned}]`
-/// - 旧格式 `["str", ...]`（自动迁移为未置顶条目）
-/// 文件缺失或损坏时返回空列表
+/// 图片保存目录（自动创建）
+pub fn images_dir() -> PathBuf {
+    data_dir().join("images")
+}
+
+/// 启动时加载历史记录；兼容三种格式：
+/// - 最新 `[{kind, text, pinned, image}]`
+/// - 旧对象格式 `[{text, pinned}]`（自动视为文本条目）
+/// - 最旧字符串数组 `["str", ...]`（自动迁移为文本条目）
 pub fn load_history() -> Vec<HistoryEntry> {
     let path = history_file_path();
     let Ok(content) = std::fs::read_to_string(&path) else {
@@ -31,7 +52,12 @@ pub fn load_history() -> Vec<HistoryEntry> {
     if let Ok(texts) = serde_json::from_str::<Vec<String>>(&content) {
         return texts
             .into_iter()
-            .map(|text| HistoryEntry { text, pinned: false })
+            .map(|text| HistoryEntry {
+                kind: "text".to_string(),
+                text,
+                pinned: false,
+                image: None,
+            })
             .collect();
     }
     Vec::new()

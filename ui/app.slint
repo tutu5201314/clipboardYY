@@ -2,7 +2,10 @@ import { ListView, Button } from "std-widgets.slint";
 
 struct Entry {
     text: string,
+    kind: int,      // 0=文本 1=图片 2=文件
     pinned: bool,
+    image: image,   // 仅 kind=1 时有内容
+    key: string,    // 去重指纹（图片=内容哈希，文本/文件=原文）
 }
 
 // 自绘标题栏：拖动移动窗口 + 置顶/隐藏/关闭
@@ -156,8 +159,20 @@ export component AppWindow inherits Window {
                             clicked => { entry-clicked(index); }
                             HorizontalLayout {
                                 padding: 8px;
+                                spacing: 8px;
+
+                                // 图片条目：显示缩略图
+                                if item.kind == 1: Image {
+                                    source: item.image;
+                                    width: 80px;
+                                    height: 56px;
+                                    image-fit: contain;
+                                }
+
+                                // 文本/文件条目：显示文字
                                 Text {
-                                    text: item.text;
+                                    visible: item.kind != 1;
+                                    text: item.kind == 2 ? "📁 " + item.text : item.text;
                                     wrap: word-wrap;
                                     color: #222;
                                 }

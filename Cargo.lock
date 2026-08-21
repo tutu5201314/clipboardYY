@@ -824,6 +824,7 @@ dependencies = [
  "arboard",
  "dirs",
  "global-hotkey",
+ "image",
  "serde",
  "serde_json",
  "slint",
