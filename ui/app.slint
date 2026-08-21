@@ -10,6 +10,7 @@ export component AppWindow inherits Window {
 
     callback refresh-clicked();
     callback clear-clicked();
+    callback entry-clicked(int);
 
     VerticalLayout {
         padding: 12px;
@@ -40,10 +41,11 @@ export component AppWindow inherits Window {
             color: #aaa;
         }
 
-        // 中部：剪贴板条目列表
+        // 中部：剪贴板条目列表（点击条目可重新复制）
         ListView {
-            for item in clipboard-items: HorizontalLayout {
-                padding: 8px;
+            for item[index] in clipboard-items: TouchArea {
+                mouse-cursor: pointer;
+                clicked => { entry-clicked(index); }
                 Rectangle {
                     border-radius: 6px;
                     background: #f5f5f5;

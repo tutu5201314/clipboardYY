@@ -15,6 +15,24 @@ fn read_clipboard_text() -> Option<String> {
     clipboard.get_text().ok()
 }
 
+/// 把文本写回系统剪贴板；成功返回 true
+fn write_clipboard_text(text: &str) -> bool {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(cb) => cb,
+        Err(_) => return false,
+    };
+    clipboard.set_text(text.to_string()).is_ok()
+}
+
+/// 状态栏预览：长文本截断为 30 字符，保留首尾
+fn preview(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit - 1).collect();
+    format!("{head}…")
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
 
@@ -100,6 +118,20 @@ fn main() -> Result<(), slint::PlatformError> {
         clear_model.clear();
         update_status(&ui, &*clear_model);
         ui.set_status_text("历史已清空".into());
+    });
+
+    // —— 点击条目：把该条内容重新写回系统剪贴板 ——
+    let copy_model = model.clone();
+    let copy_ui = ui.as_weak();
+    ui.on_entry_clicked(move |index| {
+        let Some(ui) = copy_ui.upgrade() else { return };
+        // ListView 的索引不会为负，这里安全转换
+        let Some(item) = copy_model.row_data(index.max(0) as usize) else { return };
+        if write_clipboard_text(item.as_str()) {
+            ui.set_status_text(format!("已复制：{}", preview(item.as_str(), 30)).into());
+        } else {
+            ui.set_status_text("复制失败：无法访问剪贴板".into());
+        }
     });
 
     // 启动时读取一次当前剪贴板
