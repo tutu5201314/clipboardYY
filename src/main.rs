@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use slint::{Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+mod storage;
+
 slint::include_modules!();
 
 /// 历史记录上限，超出后丢弃最旧的
@@ -38,6 +40,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // 历史列表模型：Rust 侧持有，Slint 侧实时反映
     let model = Rc::new(VecModel::<SharedString>::default());
+
+    // 启动时加载持久化的历史记录（最多 MAX_ENTRIES 条，最新在前）
+    {
+        let history = storage::load_history();
+        for text in history.iter().take(MAX_ENTRIES) {
+            model.push(text.clone().into());
+        }
+    }
     ui.set_clipboard_items(ModelRc::from(model.clone()));
 
     fn update_status(ui: &AppWindow, model: &dyn Model<Data = SharedString>) {
@@ -70,6 +80,18 @@ fn main() -> Result<(), slint::PlatformError> {
         while model.row_count() > MAX_ENTRIES {
             let _ = model.remove(MAX_ENTRIES);
         }
+        storage::save_history(&collect_entries(model));
+    }
+
+    /// 把模型内容按显示顺序（最新在前）收集成 Vec<String>，用于持久化
+    fn collect_entries(model: &Rc<VecModel<SharedString>>) -> Vec<String> {
+        let mut entries = Vec::with_capacity(model.row_count());
+        for i in 0..model.row_count() {
+            if let Some(item) = model.row_data(i) {
+                entries.push(item.to_string());
+            }
+        }
+        entries
     }
 
     // —— 定时轮询：每 500ms 检查剪贴板变化，自动追加历史 ——
@@ -116,6 +138,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_clear_clicked(move || {
         let Some(ui) = clear_ui.upgrade() else { return };
         clear_model.clear();
+        storage::save_history(&[]);
         update_status(&ui, &*clear_model);
         ui.set_status_text("历史已清空".into());
     });
