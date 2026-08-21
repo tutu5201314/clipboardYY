@@ -1,16 +1,23 @@
 import { ListView, Button } from "std-widgets.slint";
 
+struct Entry {
+    text: string,
+    pinned: bool,
+}
+
 export component AppWindow inherits Window {
     title: "剪贴板工具";
     width: 480px;
     height: 640px;
 
-    in property <[string]> clipboard-items: [];
+    in property <[Entry]> clipboard-items: [];
     in property <string> status-text: "0 条记录";
 
     callback refresh-clicked();
     callback clear-clicked();
     callback entry-clicked(int);
+    callback entry-pin-clicked(int);
+    callback entry-delete-clicked(int);
 
     VerticalLayout {
         padding: 12px;
@@ -41,19 +48,40 @@ export component AppWindow inherits Window {
             color: #aaa;
         }
 
-        // 中部：剪贴板条目列表（点击条目可重新复制）
+        // 中部：剪贴板条目列表
+        // 每行 = 主内容（点击复制）+ 置顶按钮 + 删除按钮
         ListView {
-            for item[index] in clipboard-items: TouchArea {
-                mouse-cursor: pointer;
-                clicked => { entry-clicked(index); }
+            for item[index] in clipboard-items: HorizontalLayout {
+                spacing: 6px;
+
+                // 主内容区：置顶条目黄色高亮
                 Rectangle {
                     border-radius: 6px;
-                    background: #f5f5f5;
-                    Text {
-                        text: item;
-                        wrap: word-wrap;
-                        color: #222;
+                    background: item.pinned ? #fff3cd : #f5f5f5;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { entry-clicked(index); }
+                        HorizontalLayout {
+                            padding: 8px;
+                            Text {
+                                text: item.text;
+                                wrap: word-wrap;
+                                color: #222;
+                            }
+                        }
                     }
+                }
+
+                // 置顶 / 取消置顶
+                Button {
+                    text: item.pinned ? "取消置顶" : "置顶";
+                    clicked => { entry-pin-clicked(index); }
+                }
+
+                // 删除单条
+                Button {
+                    text: "删除";
+                    clicked => { entry-delete-clicked(index); }
                 }
             }
         }

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slint::{Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 
 mod storage;
 
@@ -26,7 +26,7 @@ fn write_clipboard_text(text: &str) -> bool {
     clipboard.set_text(text.to_string()).is_ok()
 }
 
-/// 状态栏预览：长文本截断为 30 字符，保留首尾
+/// 状态栏预览：长文本截断为 limit 字符（含省略号）
 fn preview(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
@@ -35,63 +35,86 @@ fn preview(text: &str, limit: usize) -> String {
     format!("{head}…")
 }
 
+/// 置顶块末尾的下标：即第一个非置顶条目的位置（新条目插在这里）
+fn first_unpinned_index(model: &VecModel<Entry>) -> usize {
+    let mut i = 0;
+    while i < model.row_count() && model.row_data(i).is_some_and(|e| e.pinned) {
+        i += 1;
+    }
+    i
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
 
     // 历史列表模型：Rust 侧持有，Slint 侧实时反映
-    let model = Rc::new(VecModel::<SharedString>::default());
+    let model = Rc::new(VecModel::<Entry>::default());
 
     // 启动时加载持久化的历史记录（最多 MAX_ENTRIES 条，最新在前）
     {
         let history = storage::load_history();
-        for text in history.iter().take(MAX_ENTRIES) {
-            model.push(text.clone().into());
+        for entry in history.iter().take(MAX_ENTRIES) {
+            model.push(Entry {
+                text: entry.text.clone().into(),
+                pinned: entry.pinned,
+            });
         }
     }
     ui.set_clipboard_items(ModelRc::from(model.clone()));
 
-    fn update_status(ui: &AppWindow, model: &dyn Model<Data = SharedString>) {
+    fn update_status(ui: &AppWindow, model: &dyn Model<Data = Entry>) {
         let count = model.row_count();
         ui.set_status_text(format!("{count} 条记录").into());
     }
     update_status(&ui, &*model);
 
-    // 新增一条记录：顶部插入 + 去重 + 上限裁剪
-    fn push_entry(model: &Rc<VecModel<SharedString>>, text: &str) {
+    // 把模型内容按显示顺序收集成 HistoryEntry 列表，用于持久化
+    fn collect_entries(model: &Rc<VecModel<Entry>>) -> Vec<storage::HistoryEntry> {
+        let mut entries = Vec::with_capacity(model.row_count());
+        for i in 0..model.row_count() {
+            if let Some(e) = model.row_data(i) {
+                entries.push(storage::HistoryEntry {
+                    text: e.text.to_string(),
+                    pinned: e.pinned,
+                });
+            }
+        }
+        entries
+    }
+
+    // 新增一条记录：去重 + 置顶块下方插入 + 上限裁剪 + 持久化
+    fn push_entry(model: &Rc<VecModel<Entry>>, text: &str) {
         if text.trim().is_empty() {
             return;
         }
-        // 去重：与顶部最新一条相同则忽略（轮询场景最常见的重复源）
-        if let Some(top) = model.row_data(0) {
-            if top.as_str() == text {
-                return;
-            }
+        // 去重：与置顶块后最新的第一条相同则忽略（轮询最常见的重复源）
+        let newest = first_unpinned_index(model);
+        if newest < model.row_count()
+            && model.row_data(newest).is_some_and(|e| e.text.as_str() == text)
+        {
+            return;
         }
-        // 去重：历史中已存在则先移除旧位置，再置顶
+        // 去重：历史中已存在则先移除旧位置（保留其置顶状态），再重插
+        let mut existed_pinned = false;
         for i in 0..model.row_count() {
-            if let Some(existing) = model.row_data(i) {
-                if existing.as_str() == text {
-                    let _ = model.remove(i);
-                    break;
-                }
+            if model.row_data(i).is_some_and(|e| e.text.as_str() == text) {
+                existed_pinned = model.row_data(i).is_some_and(|e| e.pinned);
+                let _ = model.remove(i);
+                break;
             }
         }
-        model.insert(0, text.into());
+        let insert_at = first_unpinned_index(model);
+        model.insert(
+            insert_at,
+            Entry {
+                text: text.into(),
+                pinned: existed_pinned,
+            },
+        );
         while model.row_count() > MAX_ENTRIES {
             let _ = model.remove(MAX_ENTRIES);
         }
         storage::save_history(&collect_entries(model));
-    }
-
-    /// 把模型内容按显示顺序（最新在前）收集成 Vec<String>，用于持久化
-    fn collect_entries(model: &Rc<VecModel<SharedString>>) -> Vec<String> {
-        let mut entries = Vec::with_capacity(model.row_count());
-        for i in 0..model.row_count() {
-            if let Some(item) = model.row_data(i) {
-                entries.push(item.to_string());
-            }
-        }
-        entries
     }
 
     // —— 定时轮询：每 500ms 检查剪贴板变化，自动追加历史 ——
@@ -149,12 +172,60 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_entry_clicked(move |index| {
         let Some(ui) = copy_ui.upgrade() else { return };
         // ListView 的索引不会为负，这里安全转换
-        let Some(item) = copy_model.row_data(index.max(0) as usize) else { return };
-        if write_clipboard_text(item.as_str()) {
-            ui.set_status_text(format!("已复制：{}", preview(item.as_str(), 30)).into());
+        let Some(entry) = copy_model.row_data(index.max(0) as usize) else { return };
+        if write_clipboard_text(entry.text.as_str()) {
+            ui.set_status_text(format!("已复制：{}", preview(entry.text.as_str(), 30)).into());
         } else {
             ui.set_status_text("复制失败：无法访问剪贴板".into());
         }
+    });
+
+    // —— 置顶 / 取消置顶 ——
+    let pin_model = model.clone();
+    let pin_ui = ui.as_weak();
+    ui.on_entry_pin_clicked(move |index| {
+        let Some(ui) = pin_ui.upgrade() else { return };
+        let i = index.max(0) as usize;
+        let Some(entry) = pin_model.row_data(i) else { return };
+        if entry.pinned {
+            // 取消置顶：原地变换标记，位置不动
+            let _ = pin_model.set_row_data(
+                i,
+                Entry {
+                    text: entry.text.clone(),
+                    pinned: false,
+                },
+            );
+            ui.set_status_text(format!("已取消置顶：{}", preview(entry.text.as_str(), 20)).into());
+        } else {
+            // 置顶：先移除，再插到置顶块末尾
+            let _ = pin_model.remove(i);
+            let pin_end = first_unpinned_index(&pin_model);
+            pin_model.insert(
+                pin_end,
+                Entry {
+                    text: entry.text.clone(),
+                    pinned: true,
+                },
+            );
+            ui.set_status_text(format!("已置顶：{}", preview(entry.text.as_str(), 20)).into());
+        }
+        storage::save_history(&collect_entries(&pin_model));
+        update_status(&ui, &*pin_model);
+    });
+
+    // —— 删除单条 ——
+    let delete_model = model.clone();
+    let delete_ui = ui.as_weak();
+    ui.on_entry_delete_clicked(move |index| {
+        let Some(ui) = delete_ui.upgrade() else { return };
+        let i = index.max(0) as usize;
+        if i < delete_model.row_count() {
+            let _ = delete_model.remove(i);
+        }
+        storage::save_history(&collect_entries(&delete_model));
+        update_status(&ui, &*delete_model);
+        ui.set_status_text("已删除该条".into());
     });
 
     // 启动时读取一次当前剪贴板
