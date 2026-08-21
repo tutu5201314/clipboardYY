@@ -1,8 +1,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use slint::{LogicalPosition, Model, ModelRc, Timer, TimerMode, VecModel};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+};
 
 mod storage;
 
@@ -10,6 +17,41 @@ slint::include_modules!();
 
 /// 历史记录上限，超出后丢弃最旧的
 const MAX_ENTRIES: usize = 50;
+
+/// 窗口句柄缓存（Windows 句柄本质是指针，用 isize 存储保证 Sync）
+static HWND_CACHE: OnceLock<isize> = OnceLock::new();
+
+/// 窗口标题（与 app.slint 保持一致）
+fn window_title_wide() -> Vec<u16> {
+    "剪贴板工具".encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 通过窗口标题查找 Win32 句柄；找到后缓存
+fn find_window_hwnd() -> Option<isize> {
+    if let Some(h) = HWND_CACHE.get() {
+        return Some(*h);
+    }
+    unsafe {
+        let title = window_title_wide();
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !hwnd.is_null() {
+            let _ = HWND_CACHE.set(hwnd as isize);
+            return Some(hwnd as isize);
+        }
+    }
+    None
+}
+
+/// 置顶 / 取消置顶交由 Slint 内置的 Window.always-on-top 属性处理，
+/// 这里不再需要 Win32 手动调用。
+
+/// 恢复窗口并置为前台
+fn bring_window_to_front(hwnd: isize) {
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_RESTORE);
+        SetForegroundWindow(hwnd as HWND);
+    }
+}
 
 /// 读取系统剪贴板中的纯文本；非文本内容（图片/文件）返回 None
 fn read_clipboard_text() -> Option<String> {
@@ -138,6 +180,36 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     let _timer = timer; // 保持定时器存活到窗口关闭
 
+    // —— Win32 句柄探测：窗口在 run() 后才创建，这里周期尝试直到找到并缓存 ——
+    let handle_timer = Timer::default();
+    handle_timer.start(TimerMode::Repeated, Duration::from_millis(300), move || {
+        let _ = find_window_hwnd();
+    });
+    let _handle_timer = handle_timer;
+
+    // —— 全局快捷键：Ctrl+Alt+V 唤起窗口（避开系统 Win+V 剪贴板历史） ——
+    let hotkey_ui = ui.as_weak();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        if event.state() == HotKeyState::Pressed {
+            let weak = hotkey_ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    let _ = ui.window().show();
+                    if let Some(hwnd) = find_window_hwnd() {
+                        bring_window_to_front(hwnd);
+                    }
+                    ui.set_status_text("已唤起窗口（Ctrl+Alt+V）".into());
+                }
+            });
+        }
+    }));
+    let hotkey_manager = GlobalHotKeyManager::new().expect("全局快捷键初始化失败");
+    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
+    hotkey_manager
+        .register(hotkey)
+        .expect("注册快捷键失败（可能已被其他程序占用）");
+    let _hotkey_manager = hotkey_manager; // 保持存活直到程序退出
+
     // —— 「刷新」按钮：手动读取当前剪贴板 ——
     let refresh_model = model.clone();
     let refresh_ui = ui.as_weak();
@@ -180,7 +252,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // —— 置顶 / 取消置顶 ——
+    // —— 置顶 / 取消置顶（条目级） ——
     let pin_model = model.clone();
     let pin_ui = ui.as_weak();
     ui.on_entry_pin_clicked(move |index| {
@@ -226,6 +298,38 @@ fn main() -> Result<(), slint::PlatformError> {
         storage::save_history(&collect_entries(&delete_model));
         update_status(&ui, &*delete_model);
         ui.set_status_text("已删除该条".into());
+    });
+
+    // —— 标题栏：拖动移动窗口 ——
+    let drag_ui = ui.as_weak();
+    ui.on_drag_move(move |dx, dy| {
+        if let Some(ui) = drag_ui.upgrade() {
+            let win = ui.window();
+            let pos = win.position();
+            win.set_position(LogicalPosition::new(pos.x as f32 + dx, pos.y as f32 + dy));
+        }
+    });
+
+    // —— 标题栏：隐藏窗口（历史轮询继续，快捷键可唤回） ——
+    let hide_ui = ui.as_weak();
+    ui.on_hide_window(move || {
+        if let Some(ui) = hide_ui.upgrade() {
+            let _ = ui.window().hide();
+        }
+    });
+
+    // —— 标题栏：关闭程序 ——
+    ui.on_close_window(|| {
+        let _ = slint::quit_event_loop();
+    });
+
+    // —— 标题栏：窗口置顶开关（Slint 内置 always-on-top 属性） ——
+    let win_pin_ui = ui.as_weak();
+    ui.on_toggle_pin(move || {
+        let Some(ui) = win_pin_ui.upgrade() else { return };
+        let new_state = !ui.get_topmost();
+        ui.set_topmost(new_state);
+        ui.set_status_text(if new_state { "窗口已置顶".into() } else { "窗口已取消置顶".into() });
     });
 
     // 启动时读取一次当前剪贴板
