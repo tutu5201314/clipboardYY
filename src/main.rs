@@ -8,8 +8,8 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+    FindWindowW, GetCursorPos, GetWindowRect, IsWindowVisible, SetForegroundWindow, SetWindowPos,
+    ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
 };
 
 mod storage;
@@ -105,6 +105,11 @@ fn hide_window(hwnd: isize) {
     unsafe {
         ShowWindow(hwnd as HWND, SW_HIDE);
     }
+}
+
+/// 查询窗口当前是否可见（用于热键切换判断）
+fn is_window_visible(hwnd: isize) -> bool {
+    unsafe { IsWindowVisible(hwnd as HWND) != 0 }
 }
 
 /// 读取系统剪贴板中的纯文本；非文本内容（图片/文件）返回 None
@@ -241,18 +246,25 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     let _handle_timer = handle_timer;
 
-    // —— 全局快捷键：Ctrl+Alt+V 唤起窗口（避开系统 Win+V 剪贴板历史） ——
+    // —— 全局快捷键：Ctrl+Alt+V 切换显示/隐藏（避开系统 Win+V 剪贴板历史） ——
     let hotkey_ui = ui.as_weak();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.state() == HotKeyState::Pressed {
             let weak = hotkey_ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak.upgrade() {
-                    if let Some(hwnd) = find_window_hwnd() {
+                    let Some(hwnd) = find_window_hwnd() else { return };
+                    if is_window_visible(hwnd) {
+                        // 可见 → 隐藏到托盘
+                        hide_window(hwnd);
+                        tray::show_icon();
+                        ui.set_status_text("已隐藏到托盘（Ctrl+Alt+V 唤回）".into());
+                    } else {
+                        // 隐藏 → 唤回前台
                         show_window(hwnd);
+                        tray::hide_icon();
+                        ui.set_status_text("已唤起窗口（Ctrl+Alt+V 隐藏）".into());
                     }
-                    tray::hide_icon();
-                    ui.set_status_text("已唤起窗口（Ctrl+Alt+V）".into());
                 }
             });
         }
