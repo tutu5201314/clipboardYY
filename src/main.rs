@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use slint::{LogicalPosition, Model, ModelRc, Timer, TimerMode, VecModel};
-use windows_sys::Win32::Foundation::HWND;
+use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    FindWindowW, GetWindowRect, SetForegroundWindow, SetWindowPos, ShowWindow,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 mod storage;
@@ -50,6 +51,38 @@ fn bring_window_to_front(hwnd: isize) {
     unsafe {
         ShowWindow(hwnd as HWND, SW_RESTORE);
         SetForegroundWindow(hwnd as HWND);
+    }
+}
+
+/// 获取窗口左上角物理坐标
+fn window_pos(hwnd: isize) -> Option<(i32, i32)> {
+    unsafe {
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(hwnd as HWND, &mut rect) != 0 {
+            Some((rect.left, rect.top))
+        } else {
+            None
+        }
+    }
+}
+
+/// 设置窗口左上角物理坐标（Win32 原生，绕开 winit 无边框坐标问题）
+fn set_window_pos(hwnd: isize, left: i32, top: i32) {
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            left,
+            top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -195,6 +228,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak.upgrade() {
                     let _ = ui.window().show();
+                    let _ = ui.window().set_minimized(false);
                     if let Some(hwnd) = find_window_hwnd() {
                         bring_window_to_front(hwnd);
                     }
@@ -300,21 +334,40 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_status_text("已删除该条".into());
     });
 
-    // —— 标题栏：拖动移动窗口 ——
-    let drag_ui = ui.as_weak();
-    ui.on_drag_move(move |dx, dy| {
-        if let Some(ui) = drag_ui.upgrade() {
-            let win = ui.window();
-            let pos = win.position();
-            win.set_position(LogicalPosition::new(pos.x as f32 + dx, pos.y as f32 + dy));
+    // —— 标题栏：拖动移动窗口（锚定法：窗口位置 = 起点窗口 + (当前鼠标 - 起点鼠标)） ——
+    // 拖动锚点：Some((鼠标起点x, 鼠标起点y, 窗口起点left, 窗口起点top))
+    let drag_state: Rc<RefCell<Option<(f32, f32, i32, i32)>>> = Rc::new(RefCell::new(None));
+
+    let drag_state_begin = drag_state.clone();
+    ui.on_drag_begin(move |x, y| {
+        let Some(hwnd) = find_window_hwnd() else { return };
+        if let Some((left, top)) = window_pos(hwnd) {
+            *drag_state_begin.borrow_mut() = Some((x, y, left, top));
         }
     });
 
-    // —— 标题栏：隐藏窗口（历史轮询继续，快捷键可唤回） ——
+    let drag_state_move = drag_state.clone();
+    let drag_ui = ui.as_weak();
+    ui.on_drag_move(move |x, y| {
+        let Some(ui) = drag_ui.upgrade() else { return };
+        let Some(hwnd) = find_window_hwnd() else { return };
+        let Some((sx, sy, left0, top0)) = *drag_state_move.borrow() else { return };
+        let scale = ui.window().scale_factor();
+        let new_left = left0 + ((x - sx) * scale).round() as i32;
+        let new_top = top0 + ((y - sy) * scale).round() as i32;
+        set_window_pos(hwnd, new_left, new_top);
+    });
+
+    let drag_state_end = drag_state.clone();
+    ui.on_drag_end(move || {
+        *drag_state_end.borrow_mut() = None;
+    });
+
+    // —— 标题栏：最小化到任务栏（后台轮询继续，快捷键/任务栏可恢复） ——
     let hide_ui = ui.as_weak();
     ui.on_hide_window(move || {
         if let Some(ui) = hide_ui.upgrade() {
-            let _ = ui.window().hide();
+            let _ = ui.window().set_minimized(true);
         }
     });
 

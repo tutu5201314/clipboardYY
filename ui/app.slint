@@ -15,26 +15,29 @@ component TitleBar inherits Rectangle {
     callback hide-clicked();
     callback close-clicked();
     callback toggle-pin-clicked();
-    callback drag-move(delta-x: length, delta-y: length);
+    callback drag-begin(x: length, y: length);
+    callback drag-move(x: length, y: length);
+    callback drag-end();
 
     private property <length> last-x: 0px;
     private property <length> last-y: 0px;
 
     // 拖动层：铺满整条标题栏，按钮绘制在其上层所以不受影响
+    // 采用“锚定法”拖动：按下时上报鼠标起点，移动时上报绝对坐标，
+    // Rust 侧用「窗口起点 + (当前鼠标 - 鼠标起点)」推导位置，保证跟手不漂移
     TouchArea {
         width: 100%;
         height: 100%;
         mouse-cursor: pointer;
         pointer-event(e) => {
             if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
-                last-x = self.mouse-x;
-                last-y = self.mouse-y;
+                drag-begin(self.mouse-x, self.mouse-y);
+            } else if e.kind == PointerEventKind.up {
+                drag-end();
             }
         }
         moved => {
-            drag-move(self.mouse-x - last-x, self.mouse-y - last-y);
-            last-x = self.mouse-x;
-            last-y = self.mouse-y;
+            drag-move(self.mouse-x, self.mouse-y);
         }
     }
 
@@ -59,7 +62,7 @@ component TitleBar inherits Rectangle {
             clicked => { toggle-pin-clicked(); }
         }
         Button {
-            text: "隐藏";
+            text: "最小化";
             clicked => { hide-clicked(); }
         }
         Button {
@@ -88,7 +91,9 @@ export component AppWindow inherits Window {
     callback hide-window();
     callback close-window();
     callback toggle-pin();
-    callback drag-move(delta-x: length, delta-y: length);
+    callback drag-begin(x: length, y: length);
+    callback drag-move(x: length, y: length);
+    callback drag-end();
 
     VerticalLayout {
         padding: 0px;
@@ -100,7 +105,9 @@ export component AppWindow inherits Window {
             hide-clicked => { root.hide-window(); }
             close-clicked => { root.close-window(); }
             toggle-pin-clicked => { root.toggle-pin(); }
-            drag-move(dx, dy) => { root.drag-move(dx, dy); }
+            drag-begin(x, y) => { root.drag-begin(x, y); }
+            drag-move(x, y) => { root.drag-move(x, y); }
+            drag-end() => { root.drag-end(); }
         }
 
         // 内容区
