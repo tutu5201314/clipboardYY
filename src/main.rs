@@ -1,18 +1,19 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowRect, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    FindWindowW, GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, ShowWindow,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
 };
 
 mod storage;
+mod tray;
 
 slint::include_modules!();
 
@@ -46,10 +47,11 @@ fn find_window_hwnd() -> Option<isize> {
 /// 置顶 / 取消置顶交由 Slint 内置的 Window.always-on-top 属性处理，
 /// 这里不再需要 Win32 手动调用。
 
-/// 恢复窗口并置为前台
-fn bring_window_to_front(hwnd: isize) {
+/// 显示窗口（SW_RESTORE + SW_SHOW）并置为前台
+fn show_window(hwnd: isize) {
     unsafe {
         ShowWindow(hwnd as HWND, SW_RESTORE);
+        ShowWindow(hwnd as HWND, SW_SHOW);
         SetForegroundWindow(hwnd as HWND);
     }
 }
@@ -83,6 +85,25 @@ fn set_window_pos(hwnd: isize, left: i32, top: i32) {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 读取鼠标在屏幕上的绝对物理坐标（拖动参考系，与窗口位置无关）
+fn cursor_pos() -> Option<(i32, i32)> {
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) != 0 {
+            Some((pt.x, pt.y))
+        } else {
+            None
+        }
+    }
+}
+
+/// 隐藏窗口到托盘（Win32 原生隐藏；事件循环不受影响，轮询继续）
+fn hide_window(hwnd: isize) {
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_HIDE);
     }
 }
 
@@ -227,11 +248,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let weak = hotkey_ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak.upgrade() {
-                    let _ = ui.window().show();
-                    let _ = ui.window().set_minimized(false);
                     if let Some(hwnd) = find_window_hwnd() {
-                        bring_window_to_front(hwnd);
+                        show_window(hwnd);
                     }
+                    tray::hide_icon();
                     ui.set_status_text("已唤起窗口（Ctrl+Alt+V）".into());
                 }
             });
@@ -243,6 +263,37 @@ fn main() -> Result<(), slint::PlatformError> {
         .register(hotkey)
         .expect("注册快捷键失败（可能已被其他程序占用）");
     let _hotkey_manager = hotkey_manager; // 保持存活直到程序退出
+
+    // —— 系统托盘：隐藏时驻留，双击/右键菜单唤回或退出 ——
+    let tray_ui = Arc::new(Mutex::new(ui.as_weak()));
+    let tray_restore_ui = tray_ui.clone();
+    tray::spawn(
+        move || {
+            let weak = tray_restore_ui.lock().unwrap().clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    if let Some(hwnd) = find_window_hwnd() {
+                        show_window(hwnd);
+                    }
+                    tray::hide_icon();
+                    ui.set_status_text("已从托盘恢复".into());
+                }
+            });
+        },
+        move || {
+            let _ = slint::invoke_from_event_loop(move || {
+                let _ = slint::quit_event_loop();
+            });
+        },
+    );
+
+    // —— 标题栏：隐藏到系统托盘（后台轮询继续，托盘/快捷键唤回） ——
+    ui.on_hide_window(move || {
+        if let Some(hwnd) = find_window_hwnd() {
+            hide_window(hwnd);
+            tray::show_icon();
+        }
+    });
 
     // —— 「刷新」按钮：手动读取当前剪贴板 ——
     let refresh_model = model.clone();
@@ -334,28 +385,27 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.set_status_text("已删除该条".into());
     });
 
-    // —— 标题栏：拖动移动窗口（锚定法：窗口位置 = 起点窗口 + (当前鼠标 - 起点鼠标)） ——
-    // 拖动锚点：Some((鼠标起点x, 鼠标起点y, 窗口起点left, 窗口起点top))
-    let drag_state: Rc<RefCell<Option<(f32, f32, i32, i32)>>> = Rc::new(RefCell::new(None));
+    // —— 标题栏：拖动移动窗口 ——
+    // 锚定法 + 屏幕绝对坐标（GetCursorPos）：鼠标位移与窗口位置相互独立，
+    // 彻底消除“相对坐标随窗口移动回缩”导致的抖动和延迟
+    // 拖动锚点：Some((鼠标屏幕x, 鼠标屏幕y, 窗口起点left, 窗口起点top))
+    let drag_state: Rc<RefCell<Option<(i32, i32, i32, i32)>>> = Rc::new(RefCell::new(None));
 
     let drag_state_begin = drag_state.clone();
-    ui.on_drag_begin(move |x, y| {
+    ui.on_drag_begin(move |_mx, _my| {
         let Some(hwnd) = find_window_hwnd() else { return };
+        let Some((cx, cy)) = cursor_pos() else { return };
         if let Some((left, top)) = window_pos(hwnd) {
-            *drag_state_begin.borrow_mut() = Some((x, y, left, top));
+            *drag_state_begin.borrow_mut() = Some((cx, cy, left, top));
         }
     });
 
     let drag_state_move = drag_state.clone();
-    let drag_ui = ui.as_weak();
-    ui.on_drag_move(move |x, y| {
-        let Some(ui) = drag_ui.upgrade() else { return };
+    ui.on_drag_move(move |_mx, _my| {
         let Some(hwnd) = find_window_hwnd() else { return };
         let Some((sx, sy, left0, top0)) = *drag_state_move.borrow() else { return };
-        let scale = ui.window().scale_factor();
-        let new_left = left0 + ((x - sx) * scale).round() as i32;
-        let new_top = top0 + ((y - sy) * scale).round() as i32;
-        set_window_pos(hwnd, new_left, new_top);
+        let Some((cx, cy)) = cursor_pos() else { return };
+        set_window_pos(hwnd, left0 + (cx - sx), top0 + (cy - sy));
     });
 
     let drag_state_end = drag_state.clone();
@@ -363,16 +413,9 @@ fn main() -> Result<(), slint::PlatformError> {
         *drag_state_end.borrow_mut() = None;
     });
 
-    // —— 标题栏：最小化到任务栏（后台轮询继续，快捷键/任务栏可恢复） ——
-    let hide_ui = ui.as_weak();
-    ui.on_hide_window(move || {
-        if let Some(ui) = hide_ui.upgrade() {
-            let _ = ui.window().set_minimized(true);
-        }
-    });
-
-    // —— 标题栏：关闭程序 ——
+    // —— 标题栏：关闭程序（清理托盘图标后退出） ——
     ui.on_close_window(|| {
+        tray::shutdown();
         let _ = slint::quit_event_loop();
     });
 
